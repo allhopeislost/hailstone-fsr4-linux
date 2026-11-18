@@ -44,6 +44,11 @@ If your driver cannot do FP8, the runtime falls back to INT8 by itself.
 4. In the game, open **Options → Graphics** and set **Upscaler** to **AMD FSR 4**.
 5. Restart Hailstone. The upscaler is chosen when the game starts.
 
+## If it will not install
+
+If Hailstone says **"the kind is script, plugin or tool"**, your Hailstone is older than 0.7.2-beta and does not know
+upscaler add-ons yet. Update Hailstone, or use a build from the `main` branch.
+
 ## Remove it again
 
 Open **Add-ons → My add-ons**, pick this add-on and press **Remove**. Then set **Upscaler** back to **AMD FSR 3.1**

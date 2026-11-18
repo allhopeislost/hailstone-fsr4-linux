@@ -6,6 +6,6 @@ author allhopeislost
 description AMD FSR 4 (INT8) for Linux, through the fsr4-vk runtime.
 caps none
 notes https://github.com/allhopeislost/hailstone-fsr4-linux/releases/tag/v0.1.0
-package linux-x64 11222356 78c9be36e6d480e9eef1bc5484dd3d22ed86429ee428f3e3cf4ad59c2f64d2a9 https://github.com/allhopeislost/hailstone-fsr4-linux/releases/download/v0.1.0/fsr4-0.1.0-linux-x64.zip
+package linux-x64 11221667 ad40200558573dec441241459d973742cb10bdaa4e5618e87a756ce704a062aa https://github.com/allhopeislost/hailstone-fsr4-linux/releases/download/v0.1.0/fsr4-0.1.0-linux-x64.zip
 key ecda2bc64720692e722f02af860b126781146bb0b2f0faafb1c76a9626205600
-signature d1b19a1d0caf4537da62150727388f14a072b48710817d3af8565bcd127d5b72b74e79f0b3c3db585047517aa8874613a0ff60f78216eb516fa954a546101f03
+signature bda8ce811aef4803f1bbc04a23e65bd9a084a6d4dbb3106a5d7618f5d479c8b747d9cb67ebf5f7dd17034c296afd5aac89b85ee8541360f8489c205eacec2d04

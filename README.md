@@ -4,7 +4,8 @@ This add-on lets [Hailstone](https://github.com/projecthailstone/hailstone-clien
 FSR 4 is AMD's newest upscaler: it draws the 3D world at a lower resolution and rebuilds it at full size, with
 sharper edges and less flickering than older upscalers.
 
-It is an **unofficial preview**. It is not made by the Hailstone team and not made by AMD.
+It is an **unofficial preview**. It is not made by the Hailstone team and not made by AMD. It has been tested in the
+game on a Radeon RX 7900 GRE with CachyOS.
 
 ## What you need
 
@@ -27,45 +28,6 @@ On any other graphics card Hailstone simply keeps using its own upscaler.
 3. Press **Install**.
 4. In the game, open **Options → Graphics** and set **Upscaler** to **AMD FSR 4**.
 5. Restart Hailstone. The upscaler is chosen when the game starts.
-
-## Check that it is running
-
-Open the log, `logs/hailstone.log` in your Hailstone data folder (the same folder that holds `upscalers`), and look
-for this line:
-
-```
-FSR 4.1.1 Vulkan INT8: 858x482 to 1280x720
-```
-
-The numbers are your render size and your screen size. If you see that line, FSR 4 is doing the work.
-
-If something is wrong, Hailstone says so in the log and quietly falls back to its own **AMD FSR 3.1**. The game
-keeps working; you just do not get FSR 4.
-
-## What to expect
-
-FSR 4 costs more graphics time than FSR 3.1, because it runs a machine-learning model. In a first test on a
-Radeon RX 7900 GRE at 1440p, with the render scale at 70 %:
-
-| | AMD FSR 3.1 | AMD FSR 4 |
-|---|---|---|
-| Frame rate | 160 fps | 134 fps |
-| Frame time | 6.2 ms | 7.4 ms |
-| GPU load | 77 % | 100 % |
-
-So FSR 4 was about 1.2 ms per frame slower there, and the graphics card was fully busy. That was a quick first
-measurement, not a careful benchmark, and the two screenshots were taken at slightly different spots. On a slower
-card, or at a higher resolution, the difference can be bigger. Try it and compare with FSR 3.1 on the same spot.
-
-## Tested
-
-- **In the game**, on a Radeon RX 7900 GRE with CachyOS and Mesa RADV 26.2.6: FSR 4 ran, and the log confirmed the
-  INT8 model.
-- **Headless**, in Hailstone's zone viewer with Vulkan validation on: no validation errors.
-- **Fallback**: with the add-on missing, Hailstone used FSR 3.1 as it should.
-
-Not tested: other graphics cards, other Linux distributions, older Mesa versions, and Windows. Please report what
-you find.
 
 ## Remove it again
 

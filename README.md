@@ -12,10 +12,24 @@ game on a Radeon RX 7900 GRE with CachyOS.
 - Hailstone on Linux, 64-bit, with upscaler add-on support. That is the 0.7.2-beta release or newer; a build from
   the `main` branch works too.
 - An AMD graphics card that FSR 4 can run on: a Radeon RX 7000 or RX 9000 series, or a supported Ryzen APU.
-  On RX 9000 it uses the faster FP8 model; on RX 7000 the INT8 model.
 - A recent Mesa driver. Mesa 26.2 or newer is known to work.
 
 On any other graphics card Hailstone simply keeps using its own upscaler.
+
+## RX 7000 and RX 9000
+
+FSR 4 comes in two versions, and your graphics card decides which one runs. You do not choose it yourself.
+
+| Card | Model | Why |
+|---|---|---|
+| Radeon RX 9000 (RDNA 4) | FP8 | The card can do 8-bit floating point in hardware, so this is the fast path. |
+| Radeon RX 7000 (RDNA 3) | INT8 | The card has no FP8 hardware, so it uses the 8-bit integer model instead. |
+
+Both models make the same kind of picture. FP8 is simply cheaper to run, so on an RX 9000 the upscaler takes less
+of your frame time. On an RX 7000 it costs a little more, which is why FSR 4 there is a trade: a better picture for
+some frames per second.
+
+If your driver cannot do FP8, the runtime falls back to INT8 by itself.
 
 ## Install
 
@@ -37,7 +51,7 @@ or another choice, and restart Hailstone.
 
 ## Install by hand
 
-If you prefer not to use the add-on manager, download the `fsr4-0.1.1-linux-x64.zip` file from the
+If you prefer not to use the add-on manager, download the `fsr4-0.1.2-linux-x64.zip` file from the
 [releases page](https://github.com/allhopeislost/hailstone-fsr4-linux/releases) and unpack it into a new folder
 named `fsr4` inside the `upscalers` folder of your Hailstone data folder. Afterwards `upscalers/fsr4/fsr4.so` and
 `upscalers/fsr4/amd_fidelityfx_upscaler_vk.so` must sit together.

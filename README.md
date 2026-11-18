@@ -38,9 +38,9 @@ or another choice, and restart Hailstone.
 ## Install by hand
 
 If you prefer not to use the add-on manager, download the `fsr4-0.1.1-linux-x64.zip` file from the
-[releases page](https://github.com/allhopeislost/hailstone-fsr4-linux/releases), unpack it, and put the folder
-`fsr4` in the `upscalers` folder of your Hailstone data folder. Both `.so` files must sit together in
-`upscalers/fsr4/`.
+[releases page](https://github.com/allhopeislost/hailstone-fsr4-linux/releases) and unpack it into a new folder
+named `fsr4` inside the `upscalers` folder of your Hailstone data folder. Afterwards `upscalers/fsr4/fsr4.so` and
+`upscalers/fsr4/amd_fidelityfx_upscaler_vk.so` must sit together.
 
 ## Build it yourself
 

@@ -1,11 +1,11 @@
 hailstone-addon 1
 name fsr4
 kind upscaler
-version 0.1.0
+version 0.1.1
 author allhopeislost
-description AMD FSR 4 (INT8) for Linux, through the fsr4-vk runtime.
+description AMD FSR 4 for Linux, through the fsr4-vk runtime.
 caps none
-notes https://github.com/allhopeislost/hailstone-fsr4-linux/releases/tag/v0.1.0
-package linux-x64 11221667 ad40200558573dec441241459d973742cb10bdaa4e5618e87a756ce704a062aa https://github.com/allhopeislost/hailstone-fsr4-linux/releases/download/v0.1.0/fsr4-0.1.0-linux-x64.zip
+notes https://github.com/allhopeislost/hailstone-fsr4-linux/releases/tag/v0.1.1
+package linux-x64 11221384 5df9598aa13b49d7fc6bb9b1b0ea9692ad6d1d9d720589aec7cf46f911c0a96e https://github.com/allhopeislost/hailstone-fsr4-linux/releases/download/v0.1.1/fsr4-0.1.1-linux-x64.zip
 key ecda2bc64720692e722f02af860b126781146bb0b2f0faafb1c76a9626205600
-signature bda8ce811aef4803f1bbc04a23e65bd9a084a6d4dbb3106a5d7618f5d479c8b747d9cb67ebf5f7dd17034c296afd5aac89b85ee8541360f8489c205eacec2d04
+signature 0f9206b563bafa67f4efa861a54806e8b78b00a78c3ff4dcc1ae0353fbc6a58a60bb3a10d39641397983d5507902f1a3929c53de1d2cef4c648d79a6b3a0f300

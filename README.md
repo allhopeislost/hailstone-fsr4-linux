@@ -1,20 +1,88 @@
-# Hailstone FSR 4 for Linux
+# AMD FSR 4 for Hailstone on Linux
 
-Unofficial native Linux upscaler add-on for [Hailstone](https://github.com/projecthailstone/hailstone-client).
-Uses the FSR 4.1.1 INT8 model from [fsr4-vk](https://github.com/Astyyyyy/fsr4-vk), without Wine.
+This add-on lets [Hailstone](https://github.com/projecthailstone/hailstone-client) use **AMD FSR 4** on Linux.
+FSR 4 is AMD's newest upscaler: it draws the 3D world at a lower resolution and rebuilds it at full size, with
+sharper edges and less flickering than older upscalers.
+
+It is an **unofficial preview**. It is not made by the Hailstone team and not made by AMD.
+
+## What you need
+
+- Hailstone on Linux, 64-bit, with upscaler add-on support. That is the 0.7.2-beta release or newer; a build from
+  the `main` branch works too.
+- An AMD graphics card that FSR 4 can run on: a Radeon RX 7000 or RX 9000 series, or a supported Ryzen APU.
+- A recent Mesa driver. Mesa 26.2 or newer is known to work.
+
+On any other graphics card Hailstone simply keeps using its own upscaler.
 
 ## Install
 
-1. Use a Hailstone build with upscaler provider support.
-2. Extract the release's Linux x86-64 archive into `upscalers/` in your Hailstone data directory. Both `.so` files must be in `upscalers/fsr4/`.
-3. Choose **AMD FSR 4** in **Options → Graphics → Upscaler** and restart. Look for `FSR 4.1.1 Vulkan INT8` in the log.
+1. Start Hailstone and open **Add-ons** on the login screen.
+2. Paste this link and press **Look**:
 
-This preview is for manual installation, not the Hailstone add-on store.
-Tested in Hailstone's headless zone viewer on a Radeon RX 7900 GRE with CachyOS and RADV 26.2.6. Other distributions, older system libraries and live gameplay have not been verified.
+   ```
+   https://github.com/allhopeislost/hailstone-fsr4-linux
+   ```
 
-## Build from the release source archive
+3. Press **Install**.
+4. In the game, open **Options → Graphics** and set **Upscaler** to **AMD FSR 4**.
+5. Restart Hailstone. The upscaler is chosen when the game starts.
 
-Extract the `-source.tar.gz` release asset and run the following from its top-level directory. Follow the runtime's README for compiler and tool requirements.
+## Check that it is running
+
+Open the log, `logs/hailstone.log` in your Hailstone data folder (the same folder that holds `upscalers`), and look
+for this line:
+
+```
+FSR 4.1.1 Vulkan INT8: 858x482 to 1280x720
+```
+
+The numbers are your render size and your screen size. If you see that line, FSR 4 is doing the work.
+
+If something is wrong, Hailstone says so in the log and quietly falls back to its own **AMD FSR 3.1**. The game
+keeps working; you just do not get FSR 4.
+
+## What to expect
+
+FSR 4 costs more graphics time than FSR 3.1, because it runs a machine-learning model. In a first test on a
+Radeon RX 7900 GRE at 1440p, with the render scale at 70 %:
+
+| | AMD FSR 3.1 | AMD FSR 4 |
+|---|---|---|
+| Frame rate | 160 fps | 134 fps |
+| Frame time | 6.2 ms | 7.4 ms |
+| GPU load | 77 % | 100 % |
+
+So FSR 4 was about 1.2 ms per frame slower there, and the graphics card was fully busy. That was a quick first
+measurement, not a careful benchmark, and the two screenshots were taken at slightly different spots. On a slower
+card, or at a higher resolution, the difference can be bigger. Try it and compare with FSR 3.1 on the same spot.
+
+## Tested
+
+- **In the game**, on a Radeon RX 7900 GRE with CachyOS and Mesa RADV 26.2.6: FSR 4 ran, and the log confirmed the
+  INT8 model.
+- **Headless**, in Hailstone's zone viewer with Vulkan validation on: no validation errors.
+- **Fallback**: with the add-on missing, Hailstone used FSR 3.1 as it should.
+
+Not tested: other graphics cards, other Linux distributions, older Mesa versions, and Windows. Please report what
+you find.
+
+## Remove it again
+
+Open **Add-ons → My add-ons**, pick this add-on and press **Remove**. Then set **Upscaler** back to **AMD FSR 3.1**
+or another choice, and restart Hailstone.
+
+## Install by hand
+
+If you prefer not to use the add-on manager, download the `fsr4-0.1.0-linux-x64.zip` file from the
+[releases page](https://github.com/allhopeislost/hailstone-fsr4-linux/releases), unpack it, and put the folder
+`fsr4` in the `upscalers` folder of your Hailstone data folder. Both `.so` files must sit together in
+`upscalers/fsr4/`.
+
+## Build it yourself
+
+The release page also has a source archive with everything needed to rebuild the add-on. Follow the instructions in
+the runtime's own README for compilers and tools, then:
 
 ```sh
 cd fsr4-vk
@@ -29,9 +97,12 @@ cmake -S adapter -B adapter/build \
 cmake --build adapter/build
 ```
 
-The adapter outputs two libraries in `adapter/build/dist/`. Keep the notices from the binary release alongside them when redistributing.
-The runtime is pinned to `b0125ea9798633750f83ebabbc00279bcb49d8dd`.
+The result is in `adapter/build/dist/`. Keep the licence files from the release beside it if you pass it on.
 
-## Licensing
+## Licences
 
-The adapter derives from [projecthailstone/hailstone-fsr4](https://github.com/projecthailstone/hailstone-fsr4) and retains its MIT licence. The separately built `fsr4-vk` runtime is GPL-3.0-only. Its AMD shaders and weights come from the MIT-listed DirectX 12 upscaler DLL in FidelityFX SDK 2.3.0; see the runtime's third-party notices and licence files in both archives.
+The small Hailstone part of this add-on is MIT, and comes from
+[projecthailstone/hailstone-fsr4](https://github.com/projecthailstone/hailstone-fsr4). The FSR 4 runtime is built
+from [fsr4-vk](https://github.com/Astyyyyy/fsr4-vk), which is GPL-3.0-only. Its AMD shaders and model weights come
+from the DirectX 12 upscaler in AMD's FidelityFX SDK 2.3.0, which AMD lists under the MIT licence. All licence texts
+are in the `licenses` folder of the download.

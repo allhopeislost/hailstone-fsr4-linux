@@ -4,7 +4,7 @@ This add-on lets [Hailstone](https://github.com/projecthailstone/hailstone-clien
 FSR 4 is AMD's newest upscaler: it draws the 3D world at a lower resolution and rebuilds it at full size, with
 sharper edges and less flickering than older upscalers.
 
-It is an **unofficial preview**. It is not made by the Hailstone team and not made by AMD. It has been tested in the
+It is an **unofficial preview**. It is not made by by AMD. It has been tested in the
 game on a Radeon RX 7900 GRE with CachyOS.
 
 ## What you need

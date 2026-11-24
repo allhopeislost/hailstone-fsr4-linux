@@ -1,40 +1,37 @@
 // SPDX-License-Identifier: MIT
-// AMD FSR 4 (FSR Upscaling, the machine-learned one) as a Hailstone upscaler provider (the client's
-// sdk/hailstone_upscaler.h and docs/plugins.md "Upscaler providers").
+// AMD FSR 4 as a Hailstone upscaler provider (sdk/hailstone_upscaler.h).
 //
-// The runtime is AMD's signed binary distribution (the FidelityFX SDK 2.4.0's signedbin/): amd_fidelityfx_loader_vk.dll,
-// which this loads by its full path, finds amd_fidelityfx_upscaler_vk.dll in its own folder (the SDK's
-// docs/getting-started/ffx-api.md "Effect DLL lookup"). Only the SDK's MIT headers are compiled in.
+// The adapter loads the native fsr4-vk runtime beside it and translates Hailstone's
+// frame contract to the FidelityFX API. The runtime is built from the pinned
+// ebuwiz/fsr4-vk submodule; no AMD DLL is loaded at run time.
 //
-// The upscaler DLL holds FSR 4 and the older FSR 3.1 and 2. Hailstone has FSR 3.1 of its own, so this provider runs
-// only where FSR 4 does (an AMD Radeon RX 7000 or 9000, or a supported Ryzen APU): on any other GPU it says no at
-// create, and the client uses its own FSR 3.1.
-//
-// What the client gives, as FSR wants it (the SDK's docs/techniques/super-resolution-ml.md and -upscaler.md):
-//   colour   linear HDR before the exposure: FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE with FSR's own auto exposure, as
-//            the client's own FSR 3.1 runs
-//   motion   UV at the render size, previous minus current: motionVectorScale is the render size
-//   depth    reverse Z with a finite far plane: FFX_UPSCALE_ENABLE_DEPTH_INVERTED
-//   reactive R8 0..1: FSR's reactive mask, when the client draws one
-//   jitter   render pixels in FSR's convention, as it is
-//   inputs in SHADER_READ_ONLY_OPTIMAL (FSR's "compute read" state), the output in GENERAL (unordered access)
+// Hailstone supplies linear HDR colour, reverse-Z depth, render-resolution motion
+// vectors and an optional reactive mask. FSR runs its own automatic exposure and
+// RCAS sharpening. Hailstone's own frame generation remains independent of this
+// provider and continues to use the same motion and depth.
+
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
 #if !defined(_WIN32)
-// The SDK annotates these Windows exports unconditionally. We only look them up by name.
+// The SDK annotates these exports unconditionally. We only look them up by name.
 #define __declspec(x)
 #endif
 #include <ffx_api.h>
-#if !defined(_WIN32)
-#undef __declspec
-#endif
 #include <ffx_api_types.h>
 #include <ffx_upscale.h>
 #include <vk/ffx_api_vk.h>
+#if !defined(_WIN32)
+#undef __declspec
+#endif
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "hailstone_upscaler.h"
@@ -53,20 +50,25 @@ namespace {
 
 const HailstoneUpscalerHost* g_host = nullptr;
 
-void say(int level, const std::string& line) {
-    if (g_host && g_host->log) g_host->log(g_host->host, level, line.c_str());
+void say(int level, const std::string& line) noexcept {
+    if (!g_host || !g_host->log) return;
+    try {
+        g_host->log(g_host->host, level, line.c_str());
+    } catch (...) {
+    }
 }
 
-bool ok(ffxReturnCode_t r, const char* what) {
-    if (r == FFX_API_RETURN_OK) return true;
-    say(HAILSTONE_UPSCALER_LOG_ERROR, std::string(what) + " failed (FFX return " + std::to_string(r) + ")");
+bool ok(ffxReturnCode_t result, const char* what) {
+    if (result == FFX_API_RETURN_OK) return true;
+    say(HAILSTONE_UPSCALER_LOG_ERROR,
+        std::string(what) + " failed (FFX return " + std::to_string(result) + ")");
     return false;
 }
 
 #if defined(_WIN32)
-constexpr const char* kLoader = "amd_fidelityfx_loader_vk.dll";
+constexpr const char* kRuntime = "amd_fidelityfx_upscaler_vk.dll";
 #else
-constexpr const char* kLoader = "amd_fidelityfx_upscaler_vk.so"; // fsr4-vk exports the FFX API itself.
+constexpr const char* kRuntime = "amd_fidelityfx_upscaler_vk.so";
 #endif
 
 void* g_library = nullptr;
@@ -77,9 +79,9 @@ PfnFfxDispatch g_dispatch = nullptr;
 
 void* load_runtime(const std::string& path) {
 #if defined(_WIN32)
-    const int n = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-    std::wstring wide(n > 0 ? static_cast<std::size_t>(n) : 0, L'\0');
-    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wide.data(), n);
+    const int length = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    std::wstring wide(length > 0 ? static_cast<std::size_t>(length) : 0, L'\0');
+    if (length > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wide.data(), length);
     return LoadLibraryExW(wide.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
 #else
     return dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -94,10 +96,28 @@ void* symbol(const char* name) {
 #endif
 }
 
+void set_runtime_log_path(const std::string& path) {
+#if defined(_WIN32)
+    SetEnvironmentVariableA("FSR4_VK_LOG_PATH", path.c_str());
+#else
+    setenv("FSR4_VK_LOG_PATH", path.c_str(), 1);
+#endif
+}
+
 bool load_api() {
-    g_library = load_runtime(std::string(g_host->folder) + "/" + kLoader);
+    g_library = load_runtime(std::string(g_host->folder) + "/" + kRuntime);
     if (!g_library) {
-        say(HAILSTONE_UPSCALER_LOG_ERROR, std::string(kLoader) + " did not load from " + g_host->folder);
+#if defined(_WIN32)
+        const DWORD error = GetLastError();
+        say(HAILSTONE_UPSCALER_LOG_ERROR,
+            std::string(kRuntime) + " did not load from " + g_host->folder + " (Windows error " +
+                std::to_string(error) + ")");
+#else
+        const char* error = dlerror();
+        say(HAILSTONE_UPSCALER_LOG_ERROR,
+            std::string(kRuntime) + " did not load from " + g_host->folder +
+                (error ? std::string(": ") + error : ""));
+#endif
         return false;
     }
     g_create = reinterpret_cast<PfnFfxCreateContext>(symbol("ffxCreateContext"));
@@ -105,248 +125,370 @@ bool load_api() {
     g_query = reinterpret_cast<PfnFfxQuery>(symbol("ffxQuery"));
     g_dispatch = reinterpret_cast<PfnFfxDispatch>(symbol("ffxDispatch"));
     if (!g_create || !g_destroy || !g_query || !g_dispatch) {
-        say(HAILSTONE_UPSCALER_LOG_ERROR, std::string(kLoader) + " lacks the FFX API's functions");
+        say(HAILSTONE_UPSCALER_LOG_ERROR, std::string(kRuntime) + " lacks the FFX API functions");
         return false;
     }
     return true;
 }
 
-PFN_vkGetInstanceProcAddr gipa() { return reinterpret_cast<PFN_vkGetInstanceProcAddr>(g_host->get_instance_proc_addr); }
-
-// What FSR 4 may use, where the GPU has it (AMD's own sample turns these on: the SDK's Cauldron2 device_vk.cpp): the
-// FP8 model's cooperative matrices and 8-bit floats (RX 9000), the INT8 model's dot products and 8-bit integers
-// (RX 7000, APUs), compute derivatives for its prepass, subgroup size control, 16-bit floats and storage.
-struct Wanted {
-    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
-    VkPhysicalDeviceShaderFloat8FeaturesEXT float8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
-#if !defined(_WIN32)
-    VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptors{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
-#endif
-    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR};
-    std::vector<const char*> extensions;
-};
-Wanted g_wanted; // the structs stay valid until create, as the client's header asks
-
-bool has_extension(const std::vector<VkExtensionProperties>& all, const char* name) {
-    for (const auto& e : all)
-        if (std::strcmp(e.extensionName, name) == 0) return true;
-    return false;
+PFN_vkGetInstanceProcAddr gipa() {
+    return reinterpret_cast<PFN_vkGetInstanceProcAddr>(g_host->get_instance_proc_addr);
 }
 
-int instance_requirements(void*, const char* const** names, uint32_t* count, uint32_t* min_api) {
+// Features the runtime can use when the device offers them. The structs stay
+// valid until create, as required by Hailstone's provider contract.
+struct Wanted {
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cooperative{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+    VkPhysicalDeviceShaderFloat8FeaturesEXT float8{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR};
+    VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptors{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
+    std::vector<const char*> extensions;
+};
+Wanted g_wanted;
+bool g_prefer_fp8 = false;
+
+bool has_extension(const std::vector<VkExtensionProperties>& all, const char* name) {
+    return std::any_of(all.begin(), all.end(), [name](const VkExtensionProperties& extension) {
+        return std::strcmp(extension.extensionName, name) == 0;
+    });
+}
+
+int instance_requirements(void*, const char* const** names, uint32_t* count, uint32_t* min_api) noexcept {
     *names = nullptr;
     *count = 0;
     *min_api = VK_MAKE_API_VERSION(0, 1, 3, 0);
     return 1;
 }
 
-int device_requirements(void*, void* instance_handle, void* physical_handle, const char* const** names, uint32_t* count,
-                        void* features) {
-    auto instance = static_cast<VkInstance>(instance_handle);
-    auto physical = static_cast<VkPhysicalDevice>(physical_handle);
-    auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(gipa()(instance, "vkGetPhysicalDeviceProperties"));
-    auto get_features2 =
-        reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(gipa()(instance, "vkGetPhysicalDeviceFeatures2"));
-    auto enum_ext = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
-        gipa()(instance, "vkEnumerateDeviceExtensionProperties"));
-    if (!get_props || !get_features2 || !enum_ext) return 0;
-    VkPhysicalDeviceProperties props{};
-    get_props(physical, &props);
-    if (props.vendorID != 0x1002) { // AMD's PCI vendor id: FSR 4 runs on no other vendor's GPU
-        say(HAILSTONE_UPSCALER_LOG_INFO, std::string("FSR 4 needs an AMD GPU; this is ") + props.deviceName);
+int device_requirements(void*, void* instance_handle, void* physical_handle, const char* const** names,
+                        uint32_t* count, void* features) noexcept {
+    try {
+        const auto instance = static_cast<VkInstance>(instance_handle);
+        const auto physical = static_cast<VkPhysicalDevice>(physical_handle);
+        const auto get_props =
+            reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(gipa()(instance, "vkGetPhysicalDeviceProperties"));
+        const auto get_features2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+            gipa()(instance, "vkGetPhysicalDeviceFeatures2"));
+        const auto enum_ext = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+            gipa()(instance, "vkEnumerateDeviceExtensionProperties"));
+        if (!get_props || !get_features2 || !enum_ext) return 0;
+
+        VkPhysicalDeviceProperties properties{};
+        get_props(physical, &properties);
+        if (properties.vendorID != 0x1002) {
+            say(HAILSTONE_UPSCALER_LOG_INFO,
+                std::string("FSR 4 needs an AMD GPU; this is ") + properties.deviceName);
+            return 0;
+        }
+
+        uint32_t extension_count = 0;
+        enum_ext(physical, nullptr, &extension_count, nullptr);
+        std::vector<VkExtensionProperties> available(extension_count);
+        if (extension_count) enum_ext(physical, nullptr, &extension_count, available.data());
+
+        g_wanted = Wanted{};
+        Wanted& wanted = g_wanted;
+        VkPhysicalDeviceVulkan11Features have11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+        VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        VkPhysicalDeviceVulkan13Features have13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        have.pNext = &have11;
+        have11.pNext = &have12;
+        have12.pNext = &have13;
+        void** tail = &have13.pNext;
+
+        const bool cooperative = has_extension(available, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+        const bool float8 = has_extension(available, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+        const bool derivatives = has_extension(available, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+        const bool descriptors = has_extension(available, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
+        if (cooperative) {
+            *tail = &wanted.cooperative;
+            tail = &wanted.cooperative.pNext;
+        }
+        if (float8) {
+            *tail = &wanted.float8;
+            tail = &wanted.float8.pNext;
+        }
+        if (derivatives) {
+            *tail = &wanted.derivatives;
+            tail = &wanted.derivatives.pNext;
+        }
+        if (descriptors) {
+            *tail = &wanted.descriptors;
+            tail = &wanted.descriptors.pNext;
+        }
+        get_features2(physical, &have);
+
+        const std::pair<const char*, VkBool32> shared[] = {
+            {"shaderInt16", have.features.shaderInt16},
+            {"shaderStorageImageWriteWithoutFormat", have.features.shaderStorageImageWriteWithoutFormat},
+            {"storageBuffer16BitAccess", have11.storageBuffer16BitAccess},
+            {"shaderFloat16", have12.shaderFloat16},
+            {"shaderInt8", have12.shaderInt8},
+            {"storageBuffer8BitAccess", have12.storageBuffer8BitAccess},
+            {"vulkanMemoryModel", have12.vulkanMemoryModel},
+            {"bufferDeviceAddress", have12.bufferDeviceAddress},
+            {"runtimeDescriptorArray", have12.runtimeDescriptorArray},
+        };
+        for (const auto& [name, supported] : shared) {
+            if (!supported) {
+                say(HAILSTONE_UPSCALER_LOG_INFO, std::string("FSR 4 needs feature ") + name);
+                return 0;
+            }
+        }
+
+        wanted.cooperative.pNext = wanted.float8.pNext = wanted.derivatives.pNext =
+            wanted.descriptors.pNext = nullptr;
+        void* first = nullptr;
+        void** link = &first;
+        auto keep = [&](void* structure, void** next, const char* extension) {
+            *link = structure;
+            link = next;
+            wanted.extensions.push_back(extension);
+        };
+        if (cooperative && wanted.cooperative.cooperativeMatrix) {
+            wanted.cooperative.cooperativeMatrixRobustBufferAccess = VK_FALSE;
+            keep(&wanted.cooperative, &wanted.cooperative.pNext, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+        }
+        if (float8 && wanted.float8.shaderFloat8) {
+            keep(&wanted.float8, &wanted.float8.pNext, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+        }
+        if (derivatives &&
+            (wanted.derivatives.computeDerivativeGroupLinear || wanted.derivatives.computeDerivativeGroupQuads)) {
+            keep(&wanted.derivatives, &wanted.derivatives.pNext,
+                 VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+        }
+        if (descriptors && wanted.descriptors.descriptorBuffer) {
+            wanted.descriptors = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
+            wanted.descriptors.descriptorBuffer = VK_TRUE;
+            keep(&wanted.descriptors, &wanted.descriptors.pNext, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
+        }
+        *link = nullptr;
+
+        auto* f2 = static_cast<VkPhysicalDeviceFeatures2*>(features);
+        auto* f11 = static_cast<VkPhysicalDeviceVulkan11Features*>(f2->pNext);
+        auto* f12 = static_cast<VkPhysicalDeviceVulkan12Features*>(f11->pNext);
+        auto* f13 = static_cast<VkPhysicalDeviceVulkan13Features*>(f12->pNext);
+        f2->features.shaderInt16 = VK_TRUE;
+        f2->features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+        f11->storageBuffer16BitAccess = VK_TRUE;
+        f12->shaderFloat16 = VK_TRUE;
+        f12->shaderInt8 = VK_TRUE;
+        f12->storageBuffer8BitAccess = VK_TRUE;
+        f12->vulkanMemoryModel = VK_TRUE;
+        f12->bufferDeviceAddress = VK_TRUE;
+        f12->runtimeDescriptorArray = VK_TRUE;
+        f12->vulkanMemoryModelDeviceScope = have12.vulkanMemoryModelDeviceScope;
+        f13->subgroupSizeControl = have13.subgroupSizeControl;
+        f13->computeFullSubgroups = have13.computeFullSubgroups;
+        f13->shaderIntegerDotProduct = have13.shaderIntegerDotProduct;
+        if (first) {
+            auto* last = reinterpret_cast<VkBaseOutStructure*>(f13);
+            while (last->pNext) last = last->pNext;
+            last->pNext = static_cast<VkBaseOutStructure*>(first);
+        }
+
+        g_prefer_fp8 = cooperative && wanted.cooperative.cooperativeMatrix && float8 &&
+                       wanted.float8.shaderFloat8 && have13.subgroupSizeControl &&
+                       have13.computeFullSubgroups;
+        *names = wanted.extensions.data();
+        *count = static_cast<uint32_t>(wanted.extensions.size());
+        return 1;
+    } catch (...) {
+        say(HAILSTONE_UPSCALER_LOG_ERROR, "FSR 4 device probe failed");
         return 0;
     }
-    uint32_t n = 0;
-    enum_ext(physical, nullptr, &n, nullptr);
-    std::vector<VkExtensionProperties> all(n);
-    enum_ext(physical, nullptr, &n, all.data());
-
-    // What the GPU has of the extension features: asked for in one chain, then each kept only where it is there.
-    g_wanted = Wanted{};
-    Wanted& w = g_wanted;
-    VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-    VkPhysicalDeviceVulkan13Features have13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-    VkPhysicalDeviceVulkan11Features have11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
-    VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    have.pNext = &have11;
-    have11.pNext = &have12;
-    have12.pNext = &have13;
-    void** tail = &have13.pNext;
-    const bool coop = has_extension(all, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
-    const bool float8 = has_extension(all, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
-    const bool deriv = has_extension(all, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
-    if (coop) { *tail = &w.coop; tail = &w.coop.pNext; }
-    if (float8) { *tail = &w.float8; tail = &w.float8.pNext; }
-    if (deriv) { *tail = &w.derivatives; tail = &w.derivatives.pNext; }
-#if !defined(_WIN32)
-    if (!has_extension(all, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME)) return 0;
-    *tail = &w.descriptors;
-#endif
-    get_features2(physical, &have);
-
-    // The extension structs, holding only what the GPU said it has; their chain rebuilt for the client.
-    void* first = nullptr;
-    void** link = &first;
-    auto keep = [&](void* s, void** next, const char* ext) {
-        *link = s;
-        link = next;
-        w.extensions.push_back(ext);
-    };
-    w.coop.pNext = w.float8.pNext = w.derivatives.pNext = nullptr;
-    if (coop && w.coop.cooperativeMatrix) {
-        w.coop.cooperativeMatrixRobustBufferAccess = VK_FALSE;
-        keep(&w.coop, &w.coop.pNext, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
-    }
-    if (float8 && w.float8.shaderFloat8) keep(&w.float8, &w.float8.pNext, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
-    if (deriv && (w.derivatives.computeDerivativeGroupLinear || w.derivatives.computeDerivativeGroupQuads))
-        keep(&w.derivatives, &w.derivatives.pNext, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
-#if !defined(_WIN32)
-    if (!w.descriptors.descriptorBuffer || !have12.bufferDeviceAddress) return 0;
-    w.descriptors = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
-    w.descriptors.descriptorBuffer = VK_TRUE;
-    keep(&w.descriptors, &w.descriptors.pNext, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
-    // The pinned headers predate this extension; enabling it only needs its name.
-    constexpr const char* mixed_dot = "VK_VALVE_shader_mixed_float_dot_product";
-    if (has_extension(all, mixed_dot)) w.extensions.push_back(mixed_dot);
-    *link = nullptr;
-#endif
-
-    // The core features, where the GPU has them, into the client's structs.
-    auto* f2 = static_cast<VkPhysicalDeviceFeatures2*>(features);
-    auto* f11 = static_cast<VkPhysicalDeviceVulkan11Features*>(f2->pNext);
-    auto* f12 = static_cast<VkPhysicalDeviceVulkan12Features*>(f11->pNext);
-    auto* f13 = static_cast<VkPhysicalDeviceVulkan13Features*>(f12->pNext);
-    f2->features.shaderStorageImageExtendedFormats = have.features.shaderStorageImageExtendedFormats;
-    f2->features.shaderStorageImageWriteWithoutFormat = have.features.shaderStorageImageWriteWithoutFormat;
-    f2->features.shaderInt16 = have.features.shaderInt16;
-    f11->storageBuffer16BitAccess = have11.storageBuffer16BitAccess;
-    f12->shaderFloat16 = have12.shaderFloat16;
-    f12->shaderInt8 = have12.shaderInt8;
-    f12->storageBuffer8BitAccess = have12.storageBuffer8BitAccess;
-    f12->vulkanMemoryModel = have12.vulkanMemoryModel;
-#if !defined(_WIN32)
-    f12->vulkanMemoryModelDeviceScope = have12.vulkanMemoryModelDeviceScope;
-    f12->bufferDeviceAddress = have12.bufferDeviceAddress;
-#endif
-    f13->subgroupSizeControl = have13.subgroupSizeControl;
-    f13->computeFullSubgroups = have13.computeFullSubgroups;
-    f13->shaderIntegerDotProduct = have13.shaderIntegerDotProduct;
-    // Appended after the client's four structs.
-    if (first) {
-        VkBaseOutStructure* s = reinterpret_cast<VkBaseOutStructure*>(f13);
-        while (s->pNext) s = s->pNext;
-        s->pNext = static_cast<VkBaseOutStructure*>(first);
-    }
-    *names = w.extensions.data();
-    *count = static_cast<uint32_t>(w.extensions.size());
-    return 1;
 }
 
-VkDeviceContext g_device{};
-ffxContext g_context = nullptr;
-bool g_reactive = false;
-uint64_t g_fsr4_version = 0;
-std::string g_version_name;
+enum class VersionKind { Unknown, Auto, Int8, Fp8 };
 
-// The newest FSR 4 provider the runtime offers on this device (its name starts with "4."), or 0.
-uint64_t find_fsr4() {
-    ffxQueryDescGetVersions q{};
-    q.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
-    q.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-    q.device = &g_device;
+VersionKind version_kind(std::string_view name) {
+    if (name.find(" FP8") != std::string_view::npos) return VersionKind::Fp8;
+    if (name.find(" INT8") != std::string_view::npos) return VersionKind::Int8;
+    if (name.find("auto") != std::string_view::npos) return VersionKind::Auto;
+    return VersionKind::Unknown;
+}
+
+struct VersionChoice {
+    uint64_t id;
+    VersionKind kind;
+    std::string name;
+};
+std::vector<VersionChoice> g_versions;
+
+constexpr uint64_t kMaximumVersions = 64;
+
+void discover_versions() {
+    g_versions.clear();
+    ffxQueryDescGetVersions query{};
+    query.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+    query.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     uint64_t count = 0;
-    q.outputCount = &count;
-    if (!ok(g_query(nullptr, &q.header), "ffxQuery (versions)") || count == 0) return 0;
+    query.outputCount = &count;
+    if (!ok(g_query(nullptr, &query.header), "ffxQuery (versions)") || count == 0 || count > kMaximumVersions)
+        return;
+
     std::vector<uint64_t> ids(count);
     std::vector<const char*> names(count);
-    q.versionIds = ids.data();
-    q.versionNames = names.data();
-    if (!ok(g_query(nullptr, &q.header), "ffxQuery (versions)")) return 0;
+    query.versionIds = ids.data();
+    query.versionNames = names.data();
+    if (!ok(g_query(nullptr, &query.header), "ffxQuery (versions)")) return;
+
     std::string listed;
-    uint64_t best = 0;
-    for (uint64_t i = 0; i < count; ++i) {
-        const std::string name = names[i] ? names[i] : "";
-        listed += (listed.empty() ? "" : ", ") + name;
-#if defined(_WIN32)
-        const bool matches = name.rfind("4.", 0) == 0;
-#else
-        const bool matches = name.rfind("4.", 0) == 0 && name.ends_with(" INT8");
-#endif
-        if (matches && !best) {
-            best = ids[i];
-            g_version_name = name; // copied: the runtime's names may be overwritten by a later query
+    for (uint64_t index = 0; index < count; ++index) {
+        const std::string name = names[index] ? names[index] : "";
+        if (!name.empty()) {
+            listed += (listed.empty() ? "" : ", ") + name;
+            g_versions.push_back({ids[index], version_kind(name), name});
         }
     }
-    say(HAILSTONE_UPSCALER_LOG_INFO, "FSR versions on this GPU: " + listed);
-    return best;
+    say(HAILSTONE_UPSCALER_LOG_INFO, "FSR versions: " + listed);
 }
 
-int create(void*, const HailstoneUpscalerDevice* d) {
-    g_reactive = (d->flags & HAILSTONE_UPSCALER_DEVICE_REACTIVE) != 0;
-    g_device.vkDevice = static_cast<VkDevice>(d->device);
-    g_device.vkPhysicalDevice = static_cast<VkPhysicalDevice>(d->physical_device);
-    g_device.vkDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(d->get_device_proc_addr);
-    g_fsr4_version = find_fsr4();
-    if (!g_fsr4_version) {
-        say(HAILSTONE_UPSCALER_LOG_INFO, "FSR 4 does not run on this GPU or driver");
+std::vector<const VersionChoice*> ordered_versions() {
+    std::vector<const VersionChoice*> ordered;
+    auto add_kind = [&](VersionKind kind) {
+        for (const auto& version : g_versions)
+            if (version.kind == kind) ordered.push_back(&version);
+    };
+    if (g_prefer_fp8) {
+        add_kind(VersionKind::Fp8);
+        add_kind(VersionKind::Int8);
+    } else {
+        add_kind(VersionKind::Int8);
+        add_kind(VersionKind::Fp8);
+    }
+    add_kind(VersionKind::Auto);
+    return ordered;
+}
+
+VkDevice g_vk_device = VK_NULL_HANDLE;
+VkPhysicalDevice g_physical_device = VK_NULL_HANDLE;
+VkInstance g_vk_instance = VK_NULL_HANDLE;
+PFN_vkGetDeviceProcAddr g_device_proc_addr = nullptr;
+PFN_vkGetInstanceProcAddr g_instance_proc_addr = nullptr;
+ffxContext g_context = nullptr;
+bool g_reactive = false;
+std::string g_version_name;
+
+int create(void*, const HailstoneUpscalerDevice* device) noexcept {
+    try {
+        g_reactive = (device->flags & HAILSTONE_UPSCALER_DEVICE_REACTIVE) != 0;
+        g_vk_device = static_cast<VkDevice>(device->device);
+        g_physical_device = static_cast<VkPhysicalDevice>(device->physical_device);
+        g_vk_instance = static_cast<VkInstance>(device->instance);
+        g_device_proc_addr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(device->get_device_proc_addr);
+        g_instance_proc_addr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(device->get_instance_proc_addr);
+        discover_versions();
+        if (g_versions.empty()) {
+            say(HAILSTONE_UPSCALER_LOG_INFO, "FSR 4 does not advertise a usable version");
+            return 0;
+        }
+        return 1;
+    } catch (...) {
+        say(HAILSTONE_UPSCALER_LOG_ERROR, "FSR 4 provider creation failed");
         return 0;
     }
-    return 1;
 }
 
-void destroy_context() {
-    if (g_context) g_destroy(&g_context, nullptr);
+void destroy_context() noexcept {
+    if (g_context && g_destroy) {
+        try {
+            g_destroy(&g_context, nullptr);
+        } catch (...) {
+        }
+    }
     g_context = nullptr;
 }
 
-void ffx_message(uint32_t type, const wchar_t* message) {
+void ffx_message(uint32_t type, const wchar_t* message) noexcept {
     if (!message) return;
-    std::string text;
-    for (const wchar_t* p = message; *p; ++p) text += *p < 0x80 ? static_cast<char>(*p) : '?';
-    say(type == FFX_API_MESSAGE_TYPE_ERROR ? HAILSTONE_UPSCALER_LOG_ERROR : HAILSTONE_UPSCALER_LOG_WARN, "FSR: " + text);
+    try {
+        std::string text;
+        for (const wchar_t* p = message; *p; ++p) text += *p < 0x80 ? static_cast<char>(*p) : '?';
+        say(type == FFX_API_MESSAGE_TYPE_ERROR ? HAILSTONE_UPSCALER_LOG_ERROR : HAILSTONE_UPSCALER_LOG_WARN,
+            "FSR: " + text);
+    } catch (...) {
+    }
 }
 
-int resize(void*, uint32_t rw, uint32_t rh, uint32_t vw, uint32_t vh) {
-    destroy_context(); // the device is idle
-#if defined(_WIN32)
-    ffxCreateBackendVKDesc backend{};
-    backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
-    backend.deviceContext = g_device;
-#else
-    // fsr4-vk implements the original Vulkan backend descriptor, not the SDK 2.4 loader's.
+// fsr4-vk extends the original Vulkan backend descriptor with an optional
+// instance block. That block lets the runtime query cooperative-matrix tiles
+// through the same loader that created Hailstone's device.
+struct FsrVulkanInstanceDesc {
+    ffxCreateContextDescHeader header;
+    VkInstance instance;
+    PFN_vkGetInstanceProcAddr getInstanceProcAddr;
+};
+constexpr ffxStructType_t kVulkanInstanceDescType = 4u;
+
+bool create_context(const VersionChoice& version, uint32_t render_width, uint32_t render_height,
+                    uint32_t view_width, uint32_t view_height) {
+    destroy_context();
     ffxCreateBackendVKDesc_DEPRECATED backend{};
     backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK_DEPRECATED;
-    backend.vkDevice = g_device.vkDevice;
-    backend.vkPhysicalDevice = g_device.vkPhysicalDevice;
-    backend.vkDeviceProcAddr = g_device.vkDeviceProcAddr;
-#endif
-    ffxOverrideVersion version{};
-    version.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
-    version.versionId = g_fsr4_version;
+    backend.vkDevice = g_vk_device;
+    backend.vkPhysicalDevice = g_physical_device;
+    backend.vkDeviceProcAddr = g_device_proc_addr;
+
+    FsrVulkanInstanceDesc instance{};
+    instance.header.type = kVulkanInstanceDescType;
+    instance.instance = g_vk_instance;
+    instance.getInstanceProcAddr = g_instance_proc_addr;
+
+    ffxOverrideVersion override{};
+    override.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+    override.versionId = version.id;
+
     ffxCreateContextDescUpscaleVersion api{};
     api.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
     api.version = FFX_UPSCALER_VERSION;
+
     ffxCreateContextDescUpscale desc{};
     desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-    desc.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_DEPTH_INVERTED | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
-    desc.maxRenderSize = {rw, rh};
-    desc.maxUpscaleSize = {vw, vh};
+    desc.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_DEPTH_INVERTED |
+                 FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+    desc.maxRenderSize = {render_width, render_height};
+    desc.maxUpscaleSize = {view_width, view_height};
     desc.fpMessage = ffx_message;
     desc.header.pNext = &backend.header;
-    backend.header.pNext = &version.header;
-    version.header.pNext = &api.header;
+    backend.header.pNext = &instance.header;
+    instance.header.pNext = &override.header;
+    override.header.pNext = &api.header;
+
+    g_version_name = version.name;
     if (!ok(g_create(&g_context, &desc.header, nullptr), "ffxCreateContext (upscale)")) {
         g_context = nullptr;
-        return 0;
+        return false;
     }
-    say(HAILSTONE_UPSCALER_LOG_INFO, "FSR " + g_version_name + ": " + std::to_string(rw) + "x" + std::to_string(rh) +
-                                         " to " + std::to_string(vw) + "x" + std::to_string(vh));
-    return 1;
+    say(HAILSTONE_UPSCALER_LOG_INFO,
+        "FSR " + g_version_name + ": " + std::to_string(render_width) + "x" +
+            std::to_string(render_height) + " to " + std::to_string(view_width) + "x" +
+            std::to_string(view_height));
+    return true;
 }
 
-uint32_t surface_format(uint32_t vk) {
-    switch (static_cast<VkFormat>(vk)) {
+int resize(void*, uint32_t render_width, uint32_t render_height, uint32_t view_width,
+           uint32_t view_height) noexcept {
+    try {
+        for (const VersionChoice* version : ordered_versions()) {
+            if (create_context(*version, render_width, render_height, view_width, view_height)) return 1;
+        }
+        say(HAILSTONE_UPSCALER_LOG_ERROR, "FSR 4 could not create a context for this GPU");
+        return 0;
+    } catch (...) {
+        destroy_context();
+        say(HAILSTONE_UPSCALER_LOG_ERROR, "FSR 4 context creation failed");
+        return 0;
+    }
+}
+
+uint32_t surface_format(uint32_t vk_format) {
+    switch (static_cast<VkFormat>(vk_format)) {
     case VK_FORMAT_R16G16B16A16_SFLOAT: return FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT;
     case VK_FORMAT_R8_UNORM: return FFX_API_SURFACE_FORMAT_R8_UNORM;
     case VK_FORMAT_D32_SFLOAT:
@@ -356,57 +498,62 @@ uint32_t surface_format(uint32_t vk) {
     }
 }
 
-FfxApiResource resource_of(const HailstoneUpscalerImage& i, bool output) {
-    FfxApiResource r{};
-    if (!i.image) return r;
-    r.resource = reinterpret_cast<void*>(static_cast<uintptr_t>(i.image));
-    r.description.type = FFX_API_RESOURCE_TYPE_TEXTURE2D;
-    r.description.format = surface_format(i.format);
-    r.description.width = i.width;
-    r.description.height = i.height;
-    r.description.depth = 1;
-    r.description.mipCount = 1;
-    r.description.flags = FFX_API_RESOURCE_FLAGS_NONE;
-    r.description.usage = output ? FFX_API_RESOURCE_USAGE_UAV
-                          : (i.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ? FFX_API_RESOURCE_USAGE_DEPTHTARGET
-                                                                   : FFX_API_RESOURCE_USAGE_READ_ONLY;
-    r.state = output ? FFX_API_RESOURCE_STATE_UNORDERED_ACCESS : FFX_API_RESOURCE_STATE_COMPUTE_READ;
-    return r;
+FfxApiResource resource_of(const HailstoneUpscalerImage& image, bool output) {
+    FfxApiResource resource{};
+    if (!image.image) return resource;
+    resource.resource = reinterpret_cast<void*>(static_cast<uintptr_t>(image.image));
+    resource.description.type = FFX_API_RESOURCE_TYPE_TEXTURE2D;
+    resource.description.format = surface_format(image.format);
+    resource.description.width = image.width;
+    resource.description.height = image.height;
+    resource.description.depth = 1;
+    resource.description.mipCount = 1;
+    resource.description.flags = FFX_API_RESOURCE_FLAGS_NONE;
+    resource.description.usage = output ? FFX_API_RESOURCE_USAGE_UAV
+                           : (image.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ? FFX_API_RESOURCE_USAGE_DEPTHTARGET
+                                                                       : FFX_API_RESOURCE_USAGE_READ_ONLY;
+    resource.state = output ? FFX_API_RESOURCE_STATE_UNORDERED_ACCESS : FFX_API_RESOURCE_STATE_COMPUTE_READ;
+    return resource;
 }
 
-int evaluate(void*, const HailstoneUpscalerFrame* f) {
+int evaluate(void*, const HailstoneUpscalerFrame* frame) noexcept {
     if (!g_context) return 0;
-    ffxDispatchDescUpscale d{};
-    d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
-    d.commandList = f->command_buffer;
-    d.color = resource_of(f->color, false);
-    d.depth = resource_of(f->depth, false);
-    d.motionVectors = resource_of(f->motion, false);
-    if (g_reactive && f->reactive.image) d.reactive = resource_of(f->reactive, false);
-    d.output = resource_of(f->output, true);
-    d.jitterOffset = {f->jitter_x, f->jitter_y};
-    d.motionVectorScale = {f->motion_scale_x, f->motion_scale_y};
-    d.renderSize = {f->color.width, f->color.height};
-    d.upscaleSize = {f->output.width, f->output.height};
-    d.enableSharpening = f->sharpness > 0.0f;
-    d.sharpness = f->sharpness;
-    d.frameTimeDelta = f->frame_seconds * 1000.0f; // milliseconds
-    d.preExposure = 1.0f;                          // the scene as drawn, as the client's own FSR 3.1 gets it
-    d.reset = (f->flags & HAILSTONE_UPSCALER_FRAME_RESET) != 0;
-    d.cameraNear = f->near_plane;
-    d.cameraFar = f->far_plane;
-    d.cameraFovAngleVertical = f->fov_y;
-    d.viewSpaceToMetersFactor = 1.0f; // the SDK's default, as the client's own FSR 3.1 gives
-    return ok(g_dispatch(&g_context, &d.header), "ffxDispatch (upscale)") ? 1 : 0;
+    try {
+        ffxDispatchDescUpscale dispatch{};
+        dispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+        dispatch.commandList = frame->command_buffer;
+        dispatch.color = resource_of(frame->color, false);
+        dispatch.depth = resource_of(frame->depth, false);
+        dispatch.motionVectors = resource_of(frame->motion, false);
+        if (g_reactive && frame->reactive.image) dispatch.reactive = resource_of(frame->reactive, false);
+        dispatch.output = resource_of(frame->output, true);
+        dispatch.jitterOffset = {frame->jitter_x, frame->jitter_y};
+        dispatch.motionVectorScale = {frame->motion_scale_x, frame->motion_scale_y};
+        dispatch.renderSize = {frame->color.width, frame->color.height};
+        dispatch.upscaleSize = {frame->output.width, frame->output.height};
+        dispatch.enableSharpening = frame->sharpness > 0.0f;
+        dispatch.sharpness = frame->sharpness;
+        dispatch.frameTimeDelta = frame->frame_seconds * 1000.0f;
+        dispatch.preExposure = 1.0f;
+        dispatch.reset = (frame->flags & HAILSTONE_UPSCALER_FRAME_RESET) != 0;
+        dispatch.cameraNear = frame->near_plane;
+        dispatch.cameraFar = frame->far_plane;
+        dispatch.cameraFovAngleVertical = frame->fov_y;
+        dispatch.viewSpaceToMetersFactor = 1.0f;
+        return ok(g_dispatch(&g_context, &dispatch.header), "ffxDispatch (upscale)") ? 1 : 0;
+    } catch (...) {
+        say(HAILSTONE_UPSCALER_LOG_ERROR, "FSR 4 dispatch failed");
+        return 0;
+    }
 }
 
-void destroy(void*) { destroy_context(); }
+void destroy(void*) noexcept { destroy_context(); }
 
 const HailstoneUpscaler g_table = {
     HAILSTONE_UPSCALER_ABI,
     sizeof(HailstoneUpscaler),
     "AMD FSR 4",
-    HAILSTONE_UPSCALER_SHARPENS, // FSR's own RCAS at display.sharpness
+    HAILSTONE_UPSCALER_SHARPENS,
     0,
     instance_requirements,
     device_requirements,
@@ -418,9 +565,16 @@ const HailstoneUpscaler g_table = {
 
 } // namespace
 
-HAILSTONE_UPSCALER_API const HailstoneUpscaler* hailstone_upscaler(const HailstoneUpscalerHost* host) {
-    if (!host || host->abi < 1 || host->size < sizeof(HailstoneUpscalerHost)) return nullptr;
+HAILSTONE_UPSCALER_API const HailstoneUpscaler* hailstone_upscaler(const HailstoneUpscalerHost* host) noexcept {
+    if (!host || host->abi < 1 || host->size < sizeof(HailstoneUpscalerHost) || !host->folder) return nullptr;
     g_host = host;
-    if (!g_library && !load_api()) return nullptr;
-    return &g_table;
+    try {
+        if (!g_library && !load_api()) return nullptr;
+        if (host->config_dir && *host->config_dir)
+            set_runtime_log_path(std::string(host->config_dir) + "/fsr4-runtime.log");
+        return &g_table;
+    } catch (...) {
+        say(HAILSTONE_UPSCALER_LOG_ERROR, "FSR 4 provider initialisation failed");
+        return nullptr;
+    }
 }

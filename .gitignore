@@ -3,3 +3,5 @@ release/
 third_party/
 build.log
 .package/
+__pycache__/
+*.pyc

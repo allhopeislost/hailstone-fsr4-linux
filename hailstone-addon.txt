@@ -1,11 +1,12 @@
 hailstone-addon 1
 name fsr4
 kind upscaler
-version 0.1.2
+version 0.2.0
+min_client 0.7.2-beta
 author allhopeislost
-description AMD FSR 4 for Linux, through the fsr4-vk runtime.
+description AMD FSR 4.1.2 for Linux, through the ebuwiz/fsr4-vk runtime.
 caps none
-notes https://github.com/allhopeislost/hailstone-fsr4-linux/releases/tag/v0.1.2
-package linux-x64 11221706 e457352ee2f81d0404e34e5b87098dda5cd57cf11879d2776d817ba4f83edfff https://github.com/allhopeislost/hailstone-fsr4-linux/releases/download/v0.1.2/fsr4-0.1.2-linux-x64.zip
+notes https://github.com/allhopeislost/hailstone-fsr4-linux/releases/tag/v0.2.0
+package linux-x64 9790208 eee42aa3387f7f3ea6d3a9e0811294250219201616fdc70590af84502f2016db fsr4-0.2.0-linux-x64.zip
 key ecda2bc64720692e722f02af860b126781146bb0b2f0faafb1c76a9626205600
-signature 20c630f0d7c523f564bee232fdc77d8c9fda9b5dde8e83067124ddfb8eae891ed08c82394b3668c85ee6a0ef9ff7d20bf54de5b54fece5f541670d7aeff27202
+signature 40397ac690bcb3d60c09d6ba90f1662f90f8e38f2a8d602840d151c6b97fa30af2f3a3ad7deab4af35e00b39cd2c91339e39dac3f1936dc93cfcd098c67b3306
